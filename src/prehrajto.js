@@ -1,6 +1,8 @@
 const cheerio = require("cheerio");
 const NodeCache = require("node-cache");
+const { makeLogger } = require("./logger");
 
+const log = makeLogger("prehraj");
 const BASE = "https://prehraj.to";
 const searchCache = new NodeCache({ stdTTL: 60 * 5 }); // 5 min
 const UA =
@@ -24,16 +26,27 @@ function buildHeaders(token) {
 async function search(query, { token } = {}) {
   const cacheKey = `q:${query}`;
   const cached = searchCache.get(cacheKey);
-  if (cached) return cached;
+  if (cached) {
+    log.debug(`cache hit "${query}" (${cached.length} results)`);
+    return cached;
+  }
 
   const url = `${BASE}/hledej/${encodeURIComponent(query)}`;
+  log.debug("GET", url);
+  const t0 = Date.now();
   const res = await fetch(url, { headers: buildHeaders(token) });
+  const ms = Date.now() - t0;
   if (!res.ok) {
+    log.warn(`search ${res.status} (${ms}ms) "${query}"`);
     if (res.status === 404) return [];
     throw new Error(`Prehraj search ${res.status} for ${query}`);
   }
   const html = await res.text();
+  log.debug(`search "${query}" ${res.status} (${ms}ms, ${html.length} bytes)`);
   const results = parseSearchResults(html);
+  if (results.length === 0) {
+    log.warn(`search "${query}" returned 0 results — selectors may need updating`);
+  }
   searchCache.set(cacheKey, results);
   return results;
 }
@@ -102,10 +115,21 @@ function parseDuration(text) {
  * Note: these mp4 URLs are short-lived (signed). Always resolve at request time.
  */
 async function getStreams(pageUrl, { token } = {}) {
+  log.debug("GET", pageUrl);
+  const t0 = Date.now();
   const res = await fetch(pageUrl, { headers: buildHeaders(token) });
-  if (!res.ok) throw new Error(`Prehraj page ${res.status} for ${pageUrl}`);
+  const ms = Date.now() - t0;
+  if (!res.ok) {
+    log.warn(`page ${res.status} (${ms}ms) ${pageUrl}`);
+    throw new Error(`Prehraj page ${res.status} for ${pageUrl}`);
+  }
   const html = await res.text();
-  return extractSources(html);
+  log.debug(`page ${res.status} (${ms}ms, ${html.length} bytes) ${pageUrl}`);
+  const sources = extractSources(html);
+  if (sources.length === 0) {
+    log.warn(`no sources extracted from ${pageUrl} — page format may have changed`);
+  }
+  return sources;
 }
 
 function extractSources(html) {

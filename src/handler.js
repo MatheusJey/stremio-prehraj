@@ -1,19 +1,35 @@
 const { resolveQuery } = require("./cinemeta");
 const { search, getStreams } = require("./prehrajto");
+const { makeLogger, nextReqId } = require("./logger");
 
 const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
-async function streamHandler({ type, id, config }) {
+const STOPWORDS = new Set([
+  "the", "and", "for", "with", "from", "una", "los", "las",
+  "der", "die", "das", "ein", "eine"
+]);
+
+async function streamHandler({ type, id, config }, options = {}) {
   const cfg = normalizeConfig(config);
+  const reqId = nextReqId();
+  const log = makeLogger(`handler ${reqId}`);
+  const diag = { reqId, type, id, config: { ...cfg, token: cfg.token ? "(set)" : "" }, steps: [] };
+
+  log.info("=== stream request ===", { type, id });
+  log.debug("config", diag.config);
 
   let plan;
   try {
     plan = await resolveQuery(type, id);
   } catch (err) {
-    console.error("[prehraj] meta resolve failed", err.message);
-    return { streams: [] };
+    log.error("meta resolve failed", err.message);
+    diag.error = `meta: ${err.message}`;
+    return options.diag ? { streams: [], diag } : { streams: [] };
   }
+  log.info("resolved title:", plan.title, plan.kind === "series" ? `S${plan.season}E${plan.episode}` : `(${plan.year || "?"})`);
+  log.debug("search queries:", plan.queries);
+  diag.plan = plan;
 
   // Search with each query, accumulate candidates
   const seen = new Set();
@@ -23,42 +39,89 @@ async function streamHandler({ type, id, config }) {
     try {
       results = await search(q, { token: cfg.token });
     } catch (err) {
-      console.error("[prehraj] search failed", q, err.message);
+      log.warn("search failed", q, err.message);
+      diag.steps.push({ query: q, error: err.message });
       continue;
     }
+    log.info(`search "${q}" -> ${results.length} results`);
+    if (results.length) {
+      log.debug("  top 5 titles:", results.slice(0, 5).map((r) => r.title));
+    }
+    diag.steps.push({
+      query: q,
+      total: results.length,
+      sample: results.slice(0, 10).map((r) => ({
+        title: r.title,
+        url: r.url,
+        sizeBytes: r.sizeBytes,
+        durationSec: r.durationSec
+      }))
+    });
     for (const r of results) {
       if (seen.has(r.url)) continue;
       seen.add(r.url);
       candidates.push(r);
     }
-    if (candidates.length >= cfg.maxResults * 2) break;
+    if (candidates.length >= cfg.maxResults * 2) {
+      log.debug("enough candidates collected, stopping search loop");
+      break;
+    }
   }
 
+  log.info(`accumulated ${candidates.length} unique candidates`);
+
   // Filter by size and relevance (must mention title tokens + season/episode marker for series)
-  const filtered = candidates
-    .filter((c) => c.sizeBytes === 0 || c.sizeBytes >= cfg.minSizeBytes)
-    .filter((c) => isRelevant(c.title, plan))
-    .slice(0, cfg.maxResults);
+  const filterStats = { sizeRejected: 0, relevanceRejected: [] };
+  const filtered = candidates.filter((c) => {
+    if (c.sizeBytes > 0 && c.sizeBytes < cfg.minSizeBytes) {
+      filterStats.sizeRejected += 1;
+      return false;
+    }
+    const reason = relevanceReason(c.title, plan);
+    if (reason) {
+      if (filterStats.relevanceRejected.length < 10) {
+        filterStats.relevanceRejected.push({ title: c.title, reason });
+      }
+      return false;
+    }
+    return true;
+  }).slice(0, cfg.maxResults);
+
+  log.info(`filtered to ${filtered.length} (size-rejected: ${filterStats.sizeRejected}, relevance-rejected: ${candidates.length - filtered.length - filterStats.sizeRejected})`);
+  if (filterStats.relevanceRejected.length) {
+    log.debug("rejected by relevance (sample):", filterStats.relevanceRejected);
+  }
+  diag.filterStats = filterStats;
+  diag.filtered = filtered.map((c) => ({ title: c.title, url: c.url, sizeBytes: c.sizeBytes }));
 
   // Resolve each candidate to direct stream URLs in parallel
   const streams = [];
+  const extractDiag = [];
   await Promise.all(
     filtered.map(async (c) => {
       try {
         const sources = await getStreams(c.url, { token: cfg.token });
+        log.debug(`extract ${c.url} -> ${sources.length} source(s)`, sources.map((s) => s.label || "?"));
+        extractDiag.push({ url: c.url, sources: sources.length, labels: sources.map((s) => s.label) });
         for (const s of sources) {
           streams.push(buildStream(c, s, cfg.token));
         }
       } catch (err) {
-        console.error("[prehraj] extract failed", c.url, err.message);
+        log.warn("extract failed", c.url, err.message);
+        extractDiag.push({ url: c.url, error: err.message });
       }
     })
   );
+  diag.extract = extractDiag;
 
   // Sort: prefer higher resolution, then larger file size
   streams.sort((a, b) => (b._height - a._height) || (b._size - a._size));
 
-  return { streams: streams.map(stripInternal) };
+  log.info(`=== returning ${streams.length} stream(s) ===`);
+  diag.streamCount = streams.length;
+
+  const out = { streams: streams.map(stripInternal) };
+  return options.diag ? { ...out, diag } : out;
 }
 
 function buildStream(candidate, source, token) {
@@ -100,21 +163,32 @@ function stripInternal(stream) {
   return rest;
 }
 
-function isRelevant(title, plan) {
+// Returns null if relevant, or a string explaining why not.
+function relevanceReason(title, plan) {
   const t = normalize(title);
   const wanted = normalize(plan.title);
-  if (!wanted) return true;
-  // every significant token of the wanted title must appear
-  const tokens = wanted.split(" ").filter((x) => x.length > 2);
-  for (const tok of tokens) {
-    if (!t.includes(tok)) return false;
+  if (!wanted) return null;
+
+  const tokens = wanted
+    .split(" ")
+    .filter((x) => x.length > 2 && !STOPWORDS.has(x));
+
+  // require >=70% of significant tokens to appear; also at least 1 token
+  if (tokens.length === 0) return null;
+  const matched = tokens.filter((tok) => t.includes(tok));
+  if (matched.length / tokens.length < 0.7) {
+    return `title mismatch (matched ${matched.length}/${tokens.length}: [${matched.join(",")}] vs [${tokens.join(",")}])`;
   }
+
   if (plan.kind === "series") {
     const sxxexx = `s${pad(plan.season)}e${pad(plan.episode)}`;
     const alt = `${plan.season}x${pad(plan.episode)}`;
-    if (!t.includes(sxxexx) && !t.includes(alt)) return false;
+    const altSingle = `${plan.season}x${plan.episode}`;
+    if (!t.includes(sxxexx) && !t.includes(alt) && !t.includes(altSingle)) {
+      return `no episode marker (looking for ${sxxexx} / ${alt})`;
+    }
   }
-  return true;
+  return null;
 }
 
 function pad(n) {
