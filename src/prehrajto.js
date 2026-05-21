@@ -103,7 +103,14 @@ async function search(query, { token } = {}) {
   const ms = Date.now() - t0;
   if (!res.ok) {
     const body = await safePreview(res);
-    log.warn(`search ${res.status} (${ms}ms) "${query}" — body preview: ${body}`);
+    log.warn(
+      `search ${res.status} (${ms}ms) "${query}" ` +
+      `server=${res.headers.get("server") || "?"} ` +
+      `cf-ray=${res.headers.get("cf-ray") || "-"} ` +
+      `cf-mitigated=${res.headers.get("cf-mitigated") || "-"} ` +
+      `content-type=${res.headers.get("content-type") || "?"} ` +
+      `— body preview: ${body}`
+    );
     if (res.status === 404) return [];
     throw new Error(`Prehraj search ${res.status} for ${query}`);
   }
