@@ -1,4 +1,5 @@
 const { addonBuilder, getRouter } = require("stremio-addon-sdk");
+const landingTemplate = require("stremio-addon-sdk/src/landingTemplate");
 const manifest = require("./manifest");
 const { streamHandler } = require("./handler");
 const { makeLogger } = require("./logger");
@@ -15,7 +16,9 @@ builder.defineStreamHandler(async (args) => {
   }
 });
 
-const router = getRouter(builder.getInterface());
+const addonInterface = builder.getInterface();
+const router = getRouter(addonInterface);
+const landingHTML = landingTemplate(addonInterface.manifest);
 
 /**
  * Universal Node HTTP handler — works for `http.createServer` (local)
@@ -43,10 +46,11 @@ async function handleRequest(req, res) {
     return;
   }
 
-  // Friendly landing page for "/"
-  if (req.url === "/" || req.url === "") {
-    res.writeHead(302, { Location: "/manifest.json" });
-    res.end();
+  // Landing / configuration page (served by Stremio's built-in template)
+  const path = (req.url || "").split("?")[0];
+  if (path === "/" || path === "" || path === "/configure") {
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(landingHTML);
     return;
   }
 
