@@ -67,8 +67,37 @@ The cookie is only stored client-side in your Stremio install and is forwarded t
 
 ## Deploying to a public host
 
-`stremio-addon-sdk` listens on the port set in `process.env.PORT`, so it works out of the box on Beamup, Fly, Railway, Render, etc.
+### Vercel (recommended)
+
+The addon ships as a single serverless function at `api/index.js`. All routes are rewritten to it via `vercel.json`.
 
 ```bash
-PORT=7000 npm start
+npm install -g vercel    # once
+vercel login
+vercel                   # preview deploy
+vercel --prod            # production deploy
+```
+
+Vercel will give you a URL like `https://stremio-prehraj.vercel.app`. Install in Stremio with:
+
+```
+https://stremio-prehraj.vercel.app/manifest.json
+```
+
+Optional environment variables (Project Settings → Environment Variables):
+
+| Var          | Default | Purpose                                |
+|--------------|---------|----------------------------------------|
+| `LOG_LEVEL`  | `info`  | `debug` / `info` / `warn` / `error`    |
+
+Notes:
+- `maxDuration` is set to 30 s in `vercel.json` (Stremio waits up to ~10 s by default but searches can be slow).
+- In-memory cache (`node-cache`) only lasts for the warm container — that's fine for the 5-min search cache, and mp4 URLs are never cached anyway.
+
+### Generic Node hosts (Beamup, Fly, Railway, Render, …)
+
+Run the long-lived server:
+
+```bash
+PORT=7860 npm start
 ```
