@@ -1,5 +1,6 @@
 const { resolveQuery } = require("./cinemeta");
 const { search, getStreams } = require("./prehrajto");
+const { analyzeTitle, summarize } = require("./analyze");
 const { makeLogger, nextReqId } = require("./logger");
 
 const UA =
@@ -114,8 +115,12 @@ async function streamHandler({ type, id, config }, options = {}) {
   );
   diag.extract = extractDiag;
 
-  // Sort: prefer higher resolution, then larger file size
-  streams.sort((a, b) => (b._height - a._height) || (b._size - a._size));
+  // Sort: prefer CZ audio/subs first, then higher resolution, then larger file size
+  streams.sort((a, b) =>
+    (b._audioRank - a._audioRank) ||
+    (b._height - a._height) ||
+    (b._size - a._size)
+  );
 
   log.info(`=== returning ${streams.length} stream(s) ===`);
   diag.streamCount = streams.length;
@@ -125,21 +130,44 @@ async function streamHandler({ type, id, config }, options = {}) {
 }
 
 function buildStream(candidate, source, token) {
+  const meta = analyzeTitle(candidate.title);
+
+  // Best-available height: player label > release title hint
+  const height = source.height || meta.height || 0;
+  const playerLabel = source.label || (height ? `${height}p` : "");
+
+  // Tech summary (uses release-title info: source, codec, audio, subs)
+  const techSummary = summarize({ ...meta, height });
+
   const sizeGB = candidate.sizeBytes ? (candidate.sizeBytes / 1024 ** 3).toFixed(2) : null;
   const sizeLabel = sizeGB ? `${sizeGB} GB` : "";
-  const qualityLabel = source.label || (source.height ? `${source.height}p` : "");
 
-  const description = [candidate.title, [qualityLabel, sizeLabel].filter(Boolean).join(" • ")]
-    .filter(Boolean)
-    .join("\n");
+  // Compact tag for the stream name (the bold line in Stremio)
+  const audioTag =
+    meta.audio.includes("CZ-dab") ? "CZ dab"
+    : meta.audio.includes("SK-dab") ? "SK dab"
+    : meta.audio.includes("CZ-dab?") ? "CZ?"
+    : meta.subs.includes("CZ") ? "CZ tit"
+    : meta.subs.includes("SK") ? "SK tit"
+    : meta.audio.includes("EN") ? "EN"
+    : "";
+
+  const nameParts = ["Přehraj.to"];
+  if (playerLabel) nameParts.push(playerLabel);
+  if (audioTag) nameParts.push(audioTag);
+
+  const description = [
+    candidate.title,
+    [techSummary, sizeLabel].filter(Boolean).join(" • ")
+  ].filter(Boolean).join("\n");
 
   const stream = {
-    name: `Přehraj.to${qualityLabel ? " " + qualityLabel : ""}`,
+    name: nameParts.join(" "),
     description,
     url: source.url,
     behaviorHints: {
       notWebReady: false,
-      bingeGroup: `prehrajto-${qualityLabel || "default"}`,
+      bingeGroup: `prehrajto-${playerLabel || "default"}`,
       proxyHeaders: {
         request: {
           "User-Agent": UA,
@@ -147,8 +175,9 @@ function buildStream(candidate, source, token) {
         }
       }
     },
-    _height: source.height || 0,
-    _size: candidate.sizeBytes || 0
+    _height: height,
+    _size: candidate.sizeBytes || 0,
+    _audioRank: audioRank(meta)
   };
 
   if (token) {
@@ -158,8 +187,19 @@ function buildStream(candidate, source, token) {
   return stream;
 }
 
+// Sort priority: prefer CZ dub > CZ subs > SK dub > SK subs > EN > unknown.
+function audioRank(meta) {
+  if (meta.audio.includes("CZ-dab")) return 6;
+  if (meta.subs.includes("CZ")) return 5;
+  if (meta.audio.includes("CZ-dab?")) return 4;
+  if (meta.audio.includes("SK-dab")) return 3;
+  if (meta.subs.includes("SK")) return 2;
+  if (meta.audio.includes("EN")) return 1;
+  return 0;
+}
+
 function stripInternal(stream) {
-  const { _height, _size, ...rest } = stream;
+  const { _height, _size, _audioRank, ...rest } = stream;
   return rest;
 }
 
