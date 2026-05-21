@@ -8,15 +8,77 @@ const searchCache = new NodeCache({ stdTTL: 60 * 5 }); // 5 min
 const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
-function buildHeaders(token) {
+// In-memory cookie jar shared across the warm container.
+// We hydrate it once from a warmup GET on the homepage so we look
+// like a returning visitor (PHPSESSID, perms, etc.).
+const cookieJar = new Map();
+let warmupPromise = null;
+
+function buildHeaders(extraCookie) {
+  const cookieStr = formatCookies(extraCookie);
   const headers = {
     "User-Agent": UA,
-    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "cs-CZ,cs;q=0.9,en;q=0.8",
+    Accept:
+      "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "cs-CZ,cs;q=0.9,sk;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Cache-Control": "no-cache",
+    Pragma: "no-cache",
+    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"macOS"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
     Referer: BASE + "/"
   };
-  if (token) headers.Cookie = token;
+  if (cookieStr) headers.Cookie = cookieStr;
   return headers;
+}
+
+function formatCookies(extra) {
+  const parts = [];
+  for (const [k, v] of cookieJar) parts.push(`${k}=${v}`);
+  if (extra && typeof extra === "string") parts.push(extra);
+  return parts.join("; ");
+}
+
+function ingestSetCookie(res) {
+  // node fetch exposes Set-Cookie via res.headers.getSetCookie() (Node 20+)
+  const raw =
+    (res.headers.getSetCookie && res.headers.getSetCookie()) ||
+    (res.headers.raw && res.headers.raw()["set-cookie"]) ||
+    [];
+  for (const line of raw) {
+    const kv = line.split(";")[0];
+    const eq = kv.indexOf("=");
+    if (eq <= 0) continue;
+    const name = kv.slice(0, eq).trim();
+    const value = kv.slice(eq + 1).trim();
+    if (name && value) cookieJar.set(name, value);
+  }
+}
+
+async function warmup() {
+  if (warmupPromise) return warmupPromise;
+  warmupPromise = (async () => {
+    try {
+      log.info("warmup GET " + BASE + "/");
+      const t0 = Date.now();
+      const res = await fetch(BASE + "/", { headers: buildHeaders(), redirect: "follow" });
+      ingestSetCookie(res);
+      const ms = Date.now() - t0;
+      log.info(`warmup ${res.status} (${ms}ms), cookies in jar: ${cookieJar.size}`);
+      if (!res.ok) {
+        log.warn("warmup non-2xx — site may be blocking this IP range");
+      }
+    } catch (err) {
+      log.warn("warmup failed: " + err.message);
+    }
+  })();
+  return warmupPromise;
 }
 
 /**
@@ -31,13 +93,17 @@ async function search(query, { token } = {}) {
     return cached;
   }
 
+  await warmup();
+
   const url = `${BASE}/hledej/${encodeURIComponent(query)}`;
   log.debug("GET", url);
   const t0 = Date.now();
-  const res = await fetch(url, { headers: buildHeaders(token) });
+  const res = await fetch(url, { headers: buildHeaders(token), redirect: "follow" });
+  ingestSetCookie(res);
   const ms = Date.now() - t0;
   if (!res.ok) {
-    log.warn(`search ${res.status} (${ms}ms) "${query}"`);
+    const body = await safePreview(res);
+    log.warn(`search ${res.status} (${ms}ms) "${query}" — body preview: ${body}`);
     if (res.status === 404) return [];
     throw new Error(`Prehraj search ${res.status} for ${query}`);
   }
@@ -49,6 +115,15 @@ async function search(query, { token } = {}) {
   }
   searchCache.set(cacheKey, results);
   return results;
+}
+
+async function safePreview(res) {
+  try {
+    const txt = await res.text();
+    return txt.slice(0, 300).replace(/\s+/g, " ");
+  } catch {
+    return "(no body)";
+  }
 }
 
 function parseSearchResults(html) {
@@ -115,12 +190,15 @@ function parseDuration(text) {
  * Note: these mp4 URLs are short-lived (signed). Always resolve at request time.
  */
 async function getStreams(pageUrl, { token } = {}) {
+  await warmup();
   log.debug("GET", pageUrl);
   const t0 = Date.now();
-  const res = await fetch(pageUrl, { headers: buildHeaders(token) });
+  const res = await fetch(pageUrl, { headers: buildHeaders(token), redirect: "follow" });
+  ingestSetCookie(res);
   const ms = Date.now() - t0;
   if (!res.ok) {
-    log.warn(`page ${res.status} (${ms}ms) ${pageUrl}`);
+    const body = await safePreview(res);
+    log.warn(`page ${res.status} (${ms}ms) ${pageUrl} — body preview: ${body}`);
     throw new Error(`Prehraj page ${res.status} for ${pageUrl}`);
   }
   const html = await res.text();
