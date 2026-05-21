@@ -1,0 +1,18 @@
+{
+  "name": "stremio-prehraj",
+  "version": "0.1.0",
+  "description": "Stremio addon that returns direct HTTP video streams sourced from Prehraj.to",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "stremio-addon-sdk": "^1.6.10",
+    "cheerio": "^1.0.0",
+    "node-cache": "^5.1.2"
+  }
+}
